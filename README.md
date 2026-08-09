@@ -130,13 +130,27 @@
 - Hermes Agent（gateway 模式），已启用 weixin 平台适配器（iLink Bot）
 - 微信侧完成 QR 登录（`hermes gateway setup`）
 
-### 安装
+### 方式一：一键安装（推荐）
+```bash
+git clone https://github.com/nxcjs/hermes-weixin-router.git
+cd hermes-weixin-router
+bash install.sh          # 默认安装到 ~/.hermes，可指定: bash install.sh /path/to/hermes_home
+hermes gateway restart   # 加载 Hook
+```
+安装脚本幂等安全：复制 Hook/Skill/脚本到 `$HERMES_HOME`，初始化注册表（不覆盖已有）。
+
+### 方式二：手动安装
 ```bash
 # 1. 放置 Hook（用户目录，非镜像层，升级不丢）
 mkdir -p $HERMES_HOME/hooks/weixin-handoff
 cp hooks/weixin-handoff/* $HERMES_HOME/hooks/weixin-handoff/
 
-# 2. 初始化编号注册表
+# 2. 放置 Skill
+mkdir -p $HERMES_HOME/skills/weixin-task-routing
+cp skills/weixin-task-routing/SKILL.md $HERMES_HOME/skills/weixin-task-routing/
+
+# 3. 初始化编号注册表
+mkdir -p $HERMES_HOME/weixin
 cat > $HERMES_HOME/weixin/task_registry.json <<'EOF'
 {
   "version": 2,
@@ -146,11 +160,12 @@ cat > $HERMES_HOME/weixin/task_registry.json <<'EOF'
 }
 EOF
 
-# 3. 重启 gateway 加载 Hook
+# 4. 重启 gateway 加载 Hook
 hermes gateway restart
-
-# 4. 验证：微信发 #0 应返回目录
 ```
+
+### 验证
+微信发送 `#0`，应返回目录（空表时显示"注册表为空"）。
 
 ### 使用示例
 ```
