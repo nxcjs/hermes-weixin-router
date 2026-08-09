@@ -1,0 +1,12 @@
+# 敏感文件（绝不入库）
+*.env
+.env
+credentials*
+*credential*
+*token*
+accounts/
+*.json.bak
+.heartbeat
+__pycache__/
+*.pyc
+.DS_Store

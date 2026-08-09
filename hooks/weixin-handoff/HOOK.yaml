@@ -1,0 +1,5 @@
+name: weixin-handoff
+description: 微信 #编号 路由：agent:start 处理 #0 目录命令；agent:end 把对话回写到注册表指定的目标会话
+events:
+  - agent:start
+  - agent:end
