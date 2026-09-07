@@ -156,10 +156,18 @@ def _account_credentials():
 
 
 # --- 发送队列（保证每条消息最终送达）：每 chat FIFO + 后台消费者 ---
-SEND_INTERVAL_SECONDS = 2.5     # 消费者发送间隔（控制 iLink 速率）
-SEND_RETRY_MAX = 3              # 单条失败重试次数（每次间隔 30s 等 cooldown）
-SEND_RETRY_WAIT_SECONDS = 30.0  # 失败后等待（应对 iLink 30s cooldown）
+# iLink 限流实测（2026-08-09）：0.5s 间隔连续 10 条全部成功，真实阈值 >10条/8s。
+# 之前 2.5s 触发限流是「熔断后重试风暴」误判，非正常发送。调回 2s 节奏 + 短熔断。
+SEND_INTERVAL_SECONDS = 2.0     # 消费者发送间隔（实测 0.5s 都安全，2s 留余量）
+SEND_RETRY_MAX = 3              # 单条失败重试次数
+SEND_RETRY_WAIT_SECONDS = 70.0  # 限流后等待（覆盖 weixin.py 60s 熔断 + 余量）
 SEND_QUEUE_MAX = 200            # 队列上限（防内存膨胀；正常不会触顶）
+# 限流错误特征（iLink 返回的错误信息）
+RATE_LIMIT_ERROR_MARKS = ("rate limited", "rate limit", "cooldown", "频率")
+
+
+class _RateLimitedError(Exception):
+    """iLink 限流错误标记：上层等待冷却后重试。"""
 
 
 class _SendQueue:
@@ -198,27 +206,47 @@ class _SendQueue:
                 text = q.get_nowait()
             except asyncio.QueueEmpty:
                 break  # 队列空，消费者退出；新消息入队时重新启动
-            ok = await self._send_raw(chat_id, text)
+            # 每条消息发送前先等间隔，保证全程均匀节奏（首条立即发）
+            if self._history.get(chat_id):
+                await asyncio.sleep(SEND_INTERVAL_SECONDS)
+            self._history.setdefault(chat_id, []).append(time.monotonic())
+            ok = await self._send_one(chat_id, text)
             if not ok:
-                for attempt in range(SEND_RETRY_MAX):
-                    print(
-                        f"[weixin-handoff] 发送失败，{SEND_RETRY_WAIT_SECONDS:.0f}s 后重试"
-                        f"({attempt + 1}/{SEND_RETRY_MAX}): {text[:40]}",
-                        flush=True,
-                    )
-                    await asyncio.sleep(SEND_RETRY_WAIT_SECONDS)
-                    ok = await self._send_raw(chat_id, text)
-                    if ok:
-                        break
-                if not ok:
-                    print(
-                        f"[weixin-handoff] 重试耗尽，丢弃: {chat_id[:12]}... {text[:40]}",
-                        flush=True,
-                    )
-            await asyncio.sleep(SEND_INTERVAL_SECONDS)
+                print(
+                    f"[weixin-handoff] 重试耗尽，丢弃: {chat_id[:12]}... {text[:40]}",
+                    flush=True,
+                )
+
+    async def _send_one(self, chat_id: str, text: str) -> bool:
+        """发送一条消息，限流时等待冷却后重试，其他错误按固定节奏重试。"""
+        for attempt in range(SEND_RETRY_MAX):
+            try:
+                return await self._send_raw(chat_id, text)
+            except _RateLimitedError as e:
+                # iLink 限流：等待冷却结束再试（130s 覆盖 120s cooldown）
+                print(
+                    f"[weixin-handoff] 限流，等待 {SEND_RETRY_WAIT_SECONDS:.0f}s "
+                    f"冷却后重试 ({attempt + 1}/{SEND_RETRY_MAX}): {e}",
+                    flush=True,
+                )
+                await asyncio.sleep(SEND_RETRY_WAIT_SECONDS)
+            except Exception as e:
+                # 其他错误：快速重试（间隔 SEND_INTERVAL_SECONDS）
+                if attempt >= SEND_RETRY_MAX - 1:
+                    return False
+                print(
+                    f"[weixin-handoff] 发送失败，{SEND_INTERVAL_SECONDS:.0f}s 后重试"
+                    f"({attempt + 1}/{SEND_RETRY_MAX}): {e}",
+                    flush=True,
+                )
+                await asyncio.sleep(SEND_INTERVAL_SECONDS)
+        return False
 
     async def _send_raw(self, chat_id: str, text: str) -> bool:
-        """实际调用 iLink sendmessage（凭证读取 + 发送）。"""
+        """实际调用 iLink sendmessage（凭证读取 + 发送）。
+
+        失败时区分限流错误（等待 cooldown 结束）与其他错误（快速返回让上层重试）。
+        """
         creds = _account_credentials()
         if not creds or not creds["token"]:
             print("[weixin-handoff] 无微信凭证，发送失败", flush=True)
@@ -240,7 +268,11 @@ class _SendQueue:
             print(f"[weixin-handoff] 已发送到 {chat_id[:16]}...", flush=True)
             return True
         except Exception as e:
+            err = str(e)
             print(f"[weixin-handoff] 发送失败: {e}", flush=True)
+            # 限流错误：标记给上层做冷却等待（重试逻辑会等 SEND_RETRY_WAIT_SECONDS）
+            if any(mark in err.lower() for mark in RATE_LIMIT_ERROR_MARKS):
+                raise _RateLimitedError(err) from e
             return False
 
 
@@ -255,6 +287,102 @@ async def _send_weixin_text(chat_id: str, text: str) -> bool:
     - 不再阻塞 agent 流程（之前节流的 sleep 移除了）
     """
     return _send_queue.enqueue(chat_id, text)
+
+
+# --- 账本补发监控器：agent 回复限流失败后「立即补发」，不等 gateway 重启 ---
+# 背景：agent 最终回复发送失败会记入 delivery_obligations（state='failed'），
+# 但 Hermes 只在 gateway 重启时 sweep 补发（owner 还活着就跳过）——限流后消息
+# 可能要等很久甚至永远到不了。这里在 hook 层补一个循环：扫描 failed 记录，
+# 通过 hook 自己的发送队列（2s 节奏 + 70s 冷却重试）立即重发，成功才标 delivered，
+# 避免 gateway 重启时重复补发。
+LEDGER_SCAN_INTERVAL_SECONDS = 15.0
+# 补发标记（说明这是限流后自动补发，与 Hermes RECOVERED_MARKER 区分）
+LEDGER_REDELIVER_MARKER = "\n\n♻️ [补发] 本条为限流后自动补发"
+_ledger_repeater_started = False
+
+
+def _ledger_repeater_ensure_started() -> None:
+    """惰性启动补发循环（首次 handle() 触发时启动，幂等）。"""
+    global _ledger_repeater_started
+    if _ledger_repeater_started:
+        return
+    try:
+        # 无运行中事件循环时优雅失败（下次 handle() 再试），不创建悬挂协程
+        asyncio.get_running_loop()
+        asyncio.create_task(_ledger_repeater_loop())
+        _ledger_repeater_started = True
+        print("[weixin-handoff] 账本补发监控器已启动", flush=True)
+    except RuntimeError:
+        # 事件循环未就绪（测试环境/启动早期）：幂等失败，下次再试
+        print("[weixin-handoff] 账本补发监控器延迟启动（无事件循环）", flush=True)
+        _ledger_repeater_started = False
+    except Exception as e:
+        print(f"[weixin-handoff] 账本补发监控器启动失败: {e}", flush=True)
+        _ledger_repeater_started = False
+
+
+async def _ledger_repeater_loop() -> None:
+    """周期扫描 delivery_obligations 中 weixin 的 failed 记录并补发。"""
+    while True:
+        try:
+            await _redeliver_failed_weixin()
+        except Exception as e:
+            print(f"[weixin-handoff] 账本补发扫描异常: {e}", flush=True)
+        await asyncio.sleep(LEDGER_SCAN_INTERVAL_SECONDS)
+
+
+async def _redeliver_failed_weixin() -> None:
+    """扫描 state='failed' 的 weixin 记录 → 立即重发 → 成功才 mark_delivered。"""
+    try:
+        from gateway.delivery_ledger import (
+            _DB_LOCK,
+            _connect,
+            mark_attempting,
+            mark_delivered,
+        )
+    except Exception as e:
+        print(f"[weixin-handoff] 导入 delivery_ledger 失败: {e}", flush=True)
+        return
+
+    try:
+        with _DB_LOCK, _connect() as conn:
+            rows = conn.execute(
+                """SELECT obligation_id, chat_id, content
+                   FROM delivery_obligations
+                   WHERE platform='weixin' AND state='failed'
+                   ORDER BY updated_at ASC"""
+            ).fetchall()
+    except Exception as e:
+        print(f"[weixin-handoff] 扫描投递账本失败: {e}", flush=True)
+        return
+
+    for oid, chat_id, content in rows:
+        if not chat_id:
+            continue
+        try:
+            mark_attempting(oid)
+        except Exception:
+            pass
+        print(
+            f"[weixin-handoff] 补发账本消息: {oid[:12]} → {chat_id[:16]}... "
+            f"({len(content)}字符)",
+            flush=True,
+        )
+        # 同步等待发送结果（含 70s 冷却重试 ×3），成功才标 delivered
+        ok = await _send_queue._send_one(
+            chat_id, content + LEDGER_REDELIVER_MARKER
+        )
+        if ok:
+            try:
+                mark_delivered(oid)
+                print(f"[weixin-handoff] 补发成功并标记已送达: {oid[:12]}", flush=True)
+            except Exception as e:
+                print(f"[weixin-handoff] 标记已送达失败: {e}", flush=True)
+        else:
+            print(
+                f"[weixin-handoff] 补发失败（保留 failed，下次扫描再试）: {oid[:12]}",
+                flush=True,
+            )
 
 
 def _aiohttp_session():
@@ -705,6 +833,10 @@ async def _handle_new_command(chat_id: str, raw: str, name: str) -> None:
 
 
 async def handle(event_type, context):
+    # 惰性启动账本补发监控器（首次触发时启动，幂等）
+    if event_type in ("agent:start", "agent:end"):
+        _ledger_repeater_ensure_started()
+
     if event_type == "agent:start":
         await _handle_catalog_command(context)
         return
@@ -796,3 +928,18 @@ async def handle(event_type, context):
         except Exception as e:
             print(f"[weixin-handoff] note 更新失败: {e}", flush=True)
             _touch_heartbeat(f"ERROR cron-note:{e}")
+
+
+# --- 微信限流补丁（熔断等待）：hook 加载时直接对 gateway 进程内的 WeixinAdapter 打补丁 ---
+# 背景：/run/service/gateway-default/run 由 container_boot 每次启动重新生成，
+# 改启动脚本注入补丁会被覆盖（容器更新/gateway 重启均失效）。
+# hook 在 /opt/data（挂载卷）内，容器更新不丢；补丁逻辑复用
+# /opt/data/weixin_patch/weixin_patch_apply.py（与 launcher 共用同一份实现）。
+try:
+    sys.path.insert(0, "/opt/data/weixin_patch")
+    import weixin_patch_apply as _wpa
+
+    if _wpa.apply():
+        _touch_heartbeat("PATCH cooldown-wait applied")
+except Exception as _e:
+    print(f"[weixin-handoff] 限流补丁应用失败（不影响 hook 其他功能）: {_e}", flush=True)

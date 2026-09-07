@@ -5,7 +5,7 @@
 ### *微信多会话路由方案 —— Hermes Agent 专属*
 
 ![Hermes](https://img.shields.io/badge/Hermes-Agent-8B5CF6?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzhCNUNGNiIgZD0iTTEyIDJMMiA3djZsMTAgNSAxMC01VjdsLTEwLTV6TTQgOWwyIDF2NWwtMi0xVjl6bTE2IDBsLTIgMXY1bDItMVY5ek0xMiA0bDUgMi41LTUgMi41LTUtMi41IDUtMi41eiIvPjwvc3ZnPg==)
-![Version](https://img.shields.io/badge/version-1.0.0-22c55e?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.1.0-22c55e?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-iLink%20%E5%BE%AE%E4%BF%A1-3b82f6?style=flat-square)
 ![Made with](https://img.shields.io/badge/made%20with-%E2%9D%A4%EF%B8%8F%20%26%20AI-ef4444?style=flat-square)
@@ -101,9 +101,21 @@
 - 图片以路径引用回写，agent 可调用分析
 
 ### 📬 可靠投递 —— 限流不再丢消息
-- 每会话 FIFO 队列 + 后台消费者，2.5s/条节奏发送
-- 失败自动重试（30s × 3 次，覆盖 iLink cooldown）
+- 每会话 FIFO 队列 + 后台消费者，2s/条节奏发送
+- 失败自动重试（70s 冷却 × 3 次，覆盖 iLink 熔断窗口）
+- **账本补发监控器**：agent 回复限流失败入投递账本后，
+  hook 每 15s 扫描 `delivery_obligations`，冷却结束立即重发，
+  成功才标记 delivered——**不等 gateway 重启**
 - 全部机制化，**不依赖 LLM 自觉**
+
+### 🔥 熔断等待补丁 —— 根治限流风暴（v1.1.0 新增）
+- iLink 限流时 weixin.py 原逻辑"熔断期内立即失败"→ 消息入账本等重启
+- 补丁将两处失败点改为：**等待冷却结束（+2s 余量）再重试**
+- 配合全局发送门闩，积压消息冷却后逐个排空，不扎堆、不丢消息
+- **部署方式免疫容器更新**：补丁在 hook 加载时自动应用
+  （`/opt/data/weixin_patch/` + hook 末尾调用），不碰 s6 启动脚本——
+  `container_boot` 每次重生成的 run 脚本无需修改，补丁随 hook 永远生效
+- 等待上限可配：`WEIXIN_RATE_LIMIT_MAX_WAIT_SECONDS`（默认 120s）
 
 ### 🛡️ 双保险 —— Hook 机制化 + Skill 协议
 - Gateway Hook 在 `agent:start`/`agent:end` 强制执行
@@ -239,6 +251,40 @@ $HERMES_HOME/
 - 本方案运行于 `$HERMES_HOME/hooks/`（用户目录），不受 `/opt/hermes` 镜像层只读影响
 
 ---
+
+## 📜 更新日志
+
+### v1.1.0 (2026-09-08)
+
+**🔥 熔断等待补丁 —— 根治 iLink 限流丢消息**
+
+- **修复**：`weixin.py` 原逻辑在熔断期内立即失败（`raise rate_limit_error`），
+  消息入投递账本后要等 gateway 重启才补发；服务器限流(-2)触发熔断后
+  直接 break 放弃重试
+- **修复后**：两处失败点均改为"等待冷却结束（+2s 余量）再重试"，
+  配合 `_send_text_gate` 全局门闩，积压消息冷却后逐个排空
+- **新增** `weixin_patch/` 目录：
+  - `weixin_patch_apply.py` —— 补丁实现（monkeypatch
+    `WeixinAdapter._send_text_chunk_locked`，幂等，可独立调用）
+  - `gateway_launcher.py` —— 可选的启动器方式（兼容参考）
+- **部署革新**：补丁在 hook（`handler.py` 末尾）加载时自动应用，
+  不再依赖 s6 启动脚本注入——`container_boot` 每次重生成的
+  run 脚本无需修改，**容器更新 / gateway 重启均免疫**
+- **新增** 账本补发监控器（handler.py 内）：
+  - 每 15s 扫描 `delivery_obligations` 中 `state='failed'` 的微信记录
+  - 经 hook 发送队列（2s 节奏 + 70s 冷却重试）立即重发
+  - 成功才 `mark_delivered`，避免 gateway 重启时重复补发
+- **调优**：hook 发送间隔 15s→2s（iLink 实测阈值 >10条/8s），
+  重试等待 130s→70s（配合 60s 熔断时长）
+
+### v1.0.0 (2026-08-09)
+
+- 🎯 编号路由：任务/会话统一编号注册表
+- 🔁 会话接力：桌面 ↔ 微信双向同步回写
+- 🖼️ 多媒体锚定：`#N 多媒体` 图片自动归属
+- 📬 可靠投递：FIFO 发送队列 + 失败重试
+- 🛡️ Hook 机制化 + Skill 协议双保险
+- 📦 一键安装脚本 `install.sh`
 
 ## 📄 License
 
