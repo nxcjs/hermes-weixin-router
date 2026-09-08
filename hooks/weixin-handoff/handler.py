@@ -104,22 +104,191 @@ def _find_entry(registry, num):
     return None
 
 
+def _prune_dead_entries(entries: list) -> tuple[list, list]:
+    """过滤死条目：cron 不在 jobs.json / session 不在 state.db。
+
+    返回 (存活条目列表, 被清理条目列表)。死条目同时从注册表文件删除，
+    编号自动释放。任何校验失败（如 db 打不开）都保守放行，不误删。
+    """
+    alive, dead = [], []
+    # 1) 存活的 cron 任务名集合
+    try:
+        with open("/opt/data/cron/jobs.json", encoding="utf-8") as f:
+            job_names = {j.get("name") for j in json.load(f).get("jobs", [])}
+    except Exception as e:
+        print(f"[weixin-handoff] 目录校验: jobs.json 读取失败（跳过 cron 校验）: {e}", flush=True)
+        job_names = None
+    # 2) 存活的 session id 集合
+    live_sessions = None
+    try:
+        import sqlite3
+
+        db = sqlite3.connect("file:/opt/data/state.db?mode=ro", uri=True, timeout=3)
+        try:
+            live_sessions = {
+                r[0] for r in db.execute("SELECT id FROM sessions").fetchall()
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[weixin-handoff] 目录校验: state.db 读取失败（跳过 session 校验）: {e}", flush=True)
+
+    for e in entries:
+        kind = e.get("kind")
+        is_dead = False
+        if kind == "cron" and job_names is not None:
+            is_dead = e.get("name") not in job_names
+        elif kind == "session" and live_sessions is not None:
+            is_dead = e.get("session_id") not in live_sessions
+        (dead if is_dead else alive).append(e)
+
+    # 3) 死条目写回注册表（删除），失败仅告警不影响显示
+    if dead:
+        try:
+            data = _load_registry()
+            if data is not None:
+                dead_keys = {(d.get("kind"), d.get("num")) for d in dead}
+                data["entries"] = [
+                    x
+                    for x in data.get("entries", [])
+                    if (x.get("kind"), x.get("num")) not in dead_keys
+                ]
+                data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                with open(REGISTRY, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print(
+                    f"[weixin-handoff] 目录自动清理 {len(dead)} 条死条目: "
+                    f"{[(d.get('num'), (d.get('name') or '')[:12]) for d in dead]}",
+                    flush=True,
+                )
+                _touch_heartbeat(f"PRUNE {len(dead)} dead entries")
+        except Exception as e:
+            print(f"[weixin-handoff] 死条目清理失败（不影响显示）: {e}", flush=True)
+    return alive, dead
+
+
+def _sync_registry_from_sessions() -> tuple[list, int]:
+    """#0 触发时自动同步：扫描活跃会话，给没编号的自动分配编号。
+
+    活跃定义：未归档、未隐藏、有消息、非 cron 运行会话、
+    且（进行中 或 最近 30 天内结束）。
+    cron 会话每次运行是新 id，不编号（cron 任务本身有编号条目）。
+    返回 (存活条目, 新分配数)。
+    """
+    import sqlite3
+    import time as _time
+
+    data = _load_registry()
+    if data is None:
+        return [], 0
+    entries = data.get("entries", []) or []
+
+    # 1) 收集注册表现有 session 条目的 id
+    reg_ids = {e.get("session_id") for e in entries if e.get("kind") == "session"}
+
+    # 2) 扫描活跃会话
+    try:
+        db = sqlite3.connect("file:/opt/data/state.db?mode=ro", uri=True, timeout=3)
+    except Exception as e:
+        print(f"[weixin-handoff] 自动编号: state.db 打不开，跳过同步: {e}", flush=True)
+        return entries, 0
+    try:
+        now = _time.time()
+        cutoff = now - 30 * 86400  # 最近 30 天
+        rows = db.execute(
+            """
+            SELECT id, COALESCE(title, display_name, id), ended_at, message_count
+            FROM sessions
+            WHERE archived=0 AND hidden=0 AND message_count > 0
+              AND id NOT LIKE 'cron\\_%' ESCAPE '\\'
+              AND (ended_at IS NULL OR ended_at = 0 OR ended_at > ?)
+            """,
+            (cutoff,),
+        ).fetchall()
+    except Exception as e:
+        print(f"[weixin-handoff] 自动编号: 会话查询失败: {e}", flush=True)
+        return entries, 0
+    finally:
+        db.close()
+
+    # 3) 给没编号的活跃会话分配编号（跳过当前微信主会话之外的 cron 类）
+    used = {e.get("num") for e in entries}
+    added = 0
+    for sid, title, _ended, _msgs in rows:
+        if sid in reg_ids:
+            continue
+        num = 1
+        while num in used:
+            num += 1
+        used.add(num)
+        entries.append(
+            {
+                "num": num,
+                "kind": "session",
+                "name": (title or sid)[:40],
+                "session_id": sid,
+                "note": f"自动编号 ({datetime.now().strftime('%m-%d %H:%M')})",
+            }
+        )
+        reg_ids.add(sid)
+        added += 1
+
+    # 4) 写回注册表
+    if added:
+        try:
+            data["entries"] = entries
+            data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            with open(REGISTRY, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"[weixin-handoff] 自动编号: 新增 {added} 条会话条目", flush=True)
+            _touch_heartbeat(f"AUTO-NUM +{added}")
+        except Exception as e:
+            print(f"[weixin-handoff] 自动编号写回失败: {e}", flush=True)
+    return entries, added
+
+
 def _build_catalog_text() -> str:
-    """构建 #0 目录文本：注册表全部条目（编号 + 类型 + 完整名称）。"""
+    """构建 #0 目录文本：先自动同步编号，再清死链，仅列存活条目。"""
+    _sync_registry_from_sessions()  # 自动给活跃会话分配编号
     data = _load_registry()
     entries = (data or {}).get("entries", []) or []
+    entries, dead = _prune_dead_entries(entries)
 
     lines = ["📋 微信会话/任务目录", "（回复 #编号 + 内容即可续接）", ""]
     if not entries:
-        lines.append("（注册表为空，暂无编号条目）")
-    for e in sorted(entries, key=lambda x: x.get("num", 0)):
-        kind = "📅任务" if e.get("kind") == "cron" else "💬会话"
-        name = e.get("name") or "?"
-        lines.append(f"#{e.get('num')} {kind} {name}")
+        lines.append("（暂无存活的任务/会话）")
+
+    def _fmt(e) -> str:
+        kind = "📅" if e.get("kind") == "cron" else "💬"
+        # 中文微信会自动折行，无需手动换行（手动换行+缩进会与自动折行打架）。
+        # 之前"右侧被挡"元凶是长英文字符串（无空格不可断行），目录名均为中文，安全。
+        name = (e.get("name") or "?")
+        return f"#{e.get('num')} {kind} {name}"
+
+    # 分组排序：会话在前（按编号），任务在后（按编号）
+    sessions = sorted(
+        (e for e in entries if e.get("kind") != "cron"),
+        key=lambda x: x.get("num", 0),
+    )
+    crons = sorted(
+        (e for e in entries if e.get("kind") == "cron"),
+        key=lambda x: x.get("num", 0),
+    )
+    if sessions:
+        lines.append("── 会话 ──")
+        lines.extend(_fmt(e) for e in sessions)
+    if crons:
+        lines.append("")
+        lines.append("── 任务 ──")
+        lines.extend(_fmt(e) for e in crons)
+    if dead:
+        lines.append("")
+        lines.append(f"🧹 已自动清理 {len(dead)} 条失效条目")
     lines += [
         "",
-        "💡 新任务/新会话会自动分配编号；删除后编号循环利用。",
-        "在对应对话里说“推到微信接力”即可注册新会话。",
+        "💡 新任务/新会话自动编号",
+        "（删除后编号循环利用）",
+        "说“推到微信接力”可注册会话",
     ]
     return "\n".join(lines)
 

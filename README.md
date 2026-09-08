@@ -5,7 +5,7 @@
 ### *微信多会话路由方案 —— Hermes Agent 专属*
 
 ![Hermes](https://img.shields.io/badge/Hermes-Agent-8B5CF6?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzhCNUNGNiIgZD0iTTEyIDJMMiA3djZsMTAgNSAxMC01VjdsLTEwLTV6TTQgOWwyIDF2NWwtMi0xVjl6bTE2IDBsLTIgMXY1bDItMVY5ek0xMiA0bDUgMi41LTUgMi41LTUtMi41IDUtMi41eiIvPjwvc3ZnPg==)
-![Version](https://img.shields.io/badge/version-1.1.0-22c55e?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.2.0-22c55e?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-iLink%20%E5%BE%AE%E4%BF%A1-3b82f6?style=flat-square)
 ![Made with](https://img.shields.io/badge/made%20with-%E2%9D%A4%EF%B8%8F%20%26%20AI-ef4444?style=flat-square)
@@ -253,6 +253,26 @@ $HERMES_HOME/
 ---
 
 ## 📜 更新日志
+
+### v1.2.0 (2026-09-08)
+
+**🧹 智能目录 —— #0 自动编号 + 死链自清理**
+
+- **自动编号**：#0 触发时扫描全部活跃会话
+  （未归档/未隐藏/有消息/30 天内活跃），
+  没编号的自动分配最小可用编号——
+  **无需手动发消息注册**
+- **死链自清理**：#0 构建目录时校验每条目——
+  cron 对照 jobs.json、session 对照 state.db，
+  已失效条目自动从注册表移除并释放编号
+  （校验失败时保守放行，不误删）
+- **分组排序**：目录按「── 会话 ──」在前、
+  「── 任务 ──」在后分组显示
+- **排版修正**：中文条目不截断不手动换行，
+  交给微信自动折行（手动换行会与微信折行打架）；
+  底部提示拆为 ≤13 字短行，防末尾折叠
+- **修复**：注册表编号重复（#15/#16 撞号），
+  #删除 释放编号与自动分配的竞态防护
 
 ### v1.1.0 (2026-09-08)
 
